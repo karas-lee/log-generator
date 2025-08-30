@@ -4,14 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log-generator/internal/generator"
-	"log-generator/pkg/metrics"
 	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 const (

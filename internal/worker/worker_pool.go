@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"fmt"
-	"log-generator/pkg/metrics"
 	"runtime"
 	"strings"
 	"sync"
