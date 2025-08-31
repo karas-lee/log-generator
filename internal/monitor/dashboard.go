@@ -11,10 +11,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// DashboardServer - 400만 EPS 실시간 모니터링 대시보드 서버
+// DashboardServer - EPS 프로파일 기반 실시간 모니터링 대시보드 서버
 type DashboardServer struct {
 	port            int
 	metricsCollector *metrics.MetricsCollector
+	profileName     string  // 현재 프로파일 이름
+	targetEPS       int64   // 목표 EPS
 	
 	// WebSocket 연결 관리
 	clients         map[*websocket.Conn]bool
@@ -38,6 +40,8 @@ func NewDashboardServer(port int, metricsCollector *metrics.MetricsCollector) *D
 	return &DashboardServer{
 		port:            port,
 		metricsCollector: metricsCollector,
+		profileName:     "4m",     // 기본 프로파일
+		targetEPS:       4000000,  // 기본 목표
 		clients:         make(map[*websocket.Conn]bool),
 		broadcast:       make(chan []byte, 100),
 		upgrader: websocket.Upgrader{
@@ -47,6 +51,12 @@ func NewDashboardServer(port int, metricsCollector *metrics.MetricsCollector) *D
 		},
 		stopChan: make(chan struct{}),
 	}
+}
+
+// SetProfile - 프로파일 정보 설정
+func (ds *DashboardServer) SetProfile(profileName string, targetEPS int64) {
+	ds.profileName = profileName
+	ds.targetEPS = targetEPS
 }
 
 // Start - 대시보드 서버 시작
@@ -239,12 +249,17 @@ func (ds *DashboardServer) Stop() error {
 
 // generateDashboardHTML - 대시보드 HTML 생성
 func (ds *DashboardServer) generateDashboardHTML() string {
-	return `<!DOCTYPE html>
+	profileDisplay := ds.profileName
+	if ds.profileName == "custom" {
+		profileDisplay = fmt.Sprintf("Custom (%s EPS)", formatNumber(ds.targetEPS))
+	}
+	
+	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>시스템 로그 400만 EPS 실시간 모니터링</title>
+    <title>시스템 로그 EPS 실시간 모니터링</title>
     <style>
         * {
             margin: 0;
@@ -445,7 +460,7 @@ func (ds *DashboardServer) generateDashboardHTML() string {
         <div class="metric-card">
             <h3><span class="icon">⚡</span>현재 EPS</h3>
             <div class="metric-value" id="currentEPS">0</div>
-            <div class="metric-target">목표: 4,000,000 EPS</div>
+            <div class="metric-target">목표: %s EPS (프로파일: %s)</div>
             <div class="progress-bar">
                 <div class="progress-fill" id="epsProgress" style="width: 0%"></div>
             </div>
@@ -504,10 +519,10 @@ func (ds *DashboardServer) generateDashboardHTML() string {
         </div>
         
         <div class="metric-card" style="grid-column: 1 / -1;">
-            <h3><span class="icon">🔧</span>워커 상태 (40개)</h3>
+            <h3><span class="icon">🔧</span>워커 상태</h3>
             <div style="display: flex; justify-content: space-between; margin: 10px 0;">
-                <span>활성 워커: <span id="activeWorkers">0</span>/40</span>
-                <span>포트 범위: 514-553</span>
+                <span>활성 워커: <span id="activeWorkers">0</span>/<span id="totalWorkers">40</span></span>
+                <span>포트 범위: 514-<span id="lastPort">553</span></span>
             </div>
             <div class="worker-grid" id="workerGrid">
                 <!-- 워커 상태가 여기에 동적으로 생성됩니다 -->
@@ -578,7 +593,11 @@ func (ds *DashboardServer) generateDashboardHTML() string {
             
             initializeWorkerGrid() {
                 const grid = document.getElementById('workerGrid');
-                for (let i = 1; i <= 40; i++) {
+                // 서버로부터 워커 수 받아서 처리하도록 최적화
+                const workerCount = parseInt(document.getElementById('totalWorkers').textContent) || 40;
+                
+                grid.innerHTML = ''; // 기존 그리드 클리어
+                for (let i = 1; i <= workerCount; i++) {
                     const worker = document.createElement('div');
                     worker.className = 'worker-status worker-inactive';
                     worker.id = 'worker-' + i;
@@ -691,5 +710,15 @@ func (ds *DashboardServer) generateDashboardHTML() string {
         });
     </script>
 </body>
-</html>`
+</html>`, formatNumber(ds.targetEPS), profileDisplay)
+}
+
+// formatNumber - 숫자 포맷팅
+func formatNumber(n int64) string {
+	if n >= 1000000 {
+		return fmt.Sprintf("%.2fM", float64(n)/1000000)
+	} else if n >= 1000 {
+		return fmt.Sprintf("%.1fK", float64(n)/1000)
+	}
+	return fmt.Sprintf("%d", n)
 }

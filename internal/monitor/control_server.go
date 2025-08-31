@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	
+	"github.com/gorilla/websocket"
 )
 
 // ControlServer - 웹 UI 기반 로그 생성기 제어 서버
@@ -25,11 +27,18 @@ type ControlServer struct {
 	// 제어 상태
 	mutex            sync.RWMutex
 	httpServer       *http.Server
+	
+	// WebSocket 관리
+	upgrader         websocket.Upgrader
+	clients          map[*websocket.Conn]bool
+	clientsMutex     sync.RWMutex
+	broadcast        chan []byte
 }
 
 // GeneratorConfig - 로그 생성기 설정
 type GeneratorConfig struct {
 	TargetHost       string `json:"target_host"`
+	Profile          string `json:"profile"` // EPS 프로파일
 	TargetEPS        int64  `json:"target_eps"`
 	Duration         int    `json:"duration_minutes"`
 	EnableDashboard  bool   `json:"enable_dashboard"`
@@ -73,6 +82,13 @@ func NewControlServer(port int) *ControlServer {
 		metricsCollector: metrics.NewMetricsCollector(),
 		currentConfig:    getDefaultConfig(),
 		isRunning:        false,
+		clients:          make(map[*websocket.Conn]bool),
+		broadcast:        make(chan []byte, 100),
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool {
+				return true // 개발용, 프로덕션에서는 제한 필요
+			},
+		},
 	}
 }
 
@@ -80,13 +96,14 @@ func NewControlServer(port int) *ControlServer {
 func getDefaultConfig() *GeneratorConfig {
 	return &GeneratorConfig{
 		TargetHost:         "127.0.0.1",
+		Profile:            "4m", // 기본 프로파일
 		TargetEPS:          4000000,
 		Duration:           0, // 무제한
 		EnableDashboard:    true,
 		EnableOptimization: true,
 		WorkerCount:        40,
-		BatchSize:          1000,
-		SendInterval:       10,
+		BatchSize:          200,
+		SendInterval:       50,
 		MemoryLimitGB:      12,
 		GCPercent:          200,
 		LogFormats:         []string{"syslog", "apache", "nginx"},
@@ -130,6 +147,12 @@ func (cs *ControlServer) Start() error {
 	}
 	
 	fmt.Printf("🌐 로그 생성기 제어 서버 시작: http://localhost:%d\n", cs.port)
+	
+	// WebSocket 브로드캐스트 루프 시작
+	go cs.broadcastLoop()
+	
+	// 메트릭 스트리밍 시작
+	go cs.metricsStreamer()
 	
 	// HTTP 서버 시작
 	go func() {
@@ -275,10 +298,15 @@ func (cs *ControlServer) handleStart(w http.ResponseWriter, r *http.Request) {
 	
 	cs.isRunning = true
 	
+	profileName := cs.currentConfig.Profile
+	if profileName == "" {
+		profileName = "4m"
+	}
+	
 	cs.sendJSON(w, ControlResponse{
 		Success: true,
-		Message: fmt.Sprintf("로그 생성기 시작됨 (%d개 워커, 목표: %d EPS)", 
-			cs.currentConfig.WorkerCount, cs.currentConfig.TargetEPS),
+		Message: fmt.Sprintf("로그 생성기 시작됨 (프로파일: %s, %d개 워커, 목표: %d EPS)", 
+			profileName, cs.currentConfig.WorkerCount, cs.currentConfig.TargetEPS),
 	})
 }
 
@@ -401,9 +429,85 @@ func (cs *ControlServer) handleSystemOptimize(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// WebSocket 핸들러 (기존 대시보드와 동일)
+// handleWebSocket - WebSocket 연결 처리
 func (cs *ControlServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// 기존 dashboard.go의 WebSocket 로직 재사용
+	conn, err := cs.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		fmt.Printf("WebSocket 업그레이드 실패: %v\n", err)
+		return
+	}
+	
+	// 클라이언트 등록
+	cs.clientsMutex.Lock()
+	cs.clients[conn] = true
+	cs.clientsMutex.Unlock()
+	
+	fmt.Printf("새 WebSocket 클라이언트 연결: %s\n", conn.RemoteAddr())
+	
+	// 연결 해제 처리
+	defer func() {
+		cs.clientsMutex.Lock()
+		delete(cs.clients, conn)
+		cs.clientsMutex.Unlock()
+		conn.Close()
+		fmt.Printf("WebSocket 클라이언트 연결 해제: %s\n", conn.RemoteAddr())
+	}()
+	
+	// 초기 메트릭 전송
+	initialMetrics := cs.metricsCollector.GetCurrentMetrics()
+	initialData, _ := json.Marshal(initialMetrics)
+	conn.WriteMessage(websocket.TextMessage, initialData)
+	
+	// 연결 유지를 위한 핑-퐁 처리
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+	}
+}
+
+// broadcastLoop - 클라이언트들에게 메트릭 브로드캐스트
+func (cs *ControlServer) broadcastLoop() {
+	for {
+		select {
+		case message := <-cs.broadcast:
+			cs.clientsMutex.RLock()
+			for client := range cs.clients {
+				err := client.WriteMessage(websocket.TextMessage, message)
+				if err != nil {
+					client.Close()
+					delete(cs.clients, client)
+				}
+			}
+			cs.clientsMutex.RUnlock()
+		}
+	}
+}
+
+// metricsStreamer - 메트릭 스트리밍
+func (cs *ControlServer) metricsStreamer() {
+	ticker := time.NewTicker(time.Second) // 1초마다 업데이트
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ticker.C:
+			if cs.metricsCollector != nil {
+				metrics := cs.metricsCollector.GetCurrentMetrics()
+				data, err := json.Marshal(metrics)
+				if err != nil {
+					continue
+				}
+				
+				select {
+				case cs.broadcast <- data:
+				default:
+					// 브로드캐스트 채널이 가득 찬 경우 건너뜀
+				}
+			}
+		}
+	}
 }
 
 // 정적 파일 핸들러
@@ -432,6 +536,32 @@ func (cs *ControlServer) validateConfig(config *GeneratorConfig) error {
 }
 
 func (cs *ControlServer) initializeGenerator() error {
+	// 프로파일 기반 설정 처리
+	var profile *config.EPSProfile
+	
+	if cs.currentConfig.Profile == "" {
+		cs.currentConfig.Profile = "4m" // 기본값
+	}
+	
+	if cs.currentConfig.Profile == "custom" {
+		// 커스텀 프로파일 생성
+		profile = config.CalculateCustomProfile(int(cs.currentConfig.TargetEPS))
+	} else {
+		// 사전 정의된 프로파일 사용
+		var err error
+		profile, err = config.GetProfile(cs.currentConfig.Profile)
+		if err != nil {
+			return fmt.Errorf("프로파일 로드 실패: %v", err)
+		}
+	}
+	
+	// 프로파일 설정 적용
+	cs.currentConfig.WorkerCount = profile.WorkerCount
+	cs.currentConfig.BatchSize = profile.BatchSize
+	cs.currentConfig.SendInterval = profile.TickerInterval
+	cs.currentConfig.MemoryLimitGB = int(profile.MemoryLimit / (1024 * 1024 * 1024))
+	cs.currentConfig.GCPercent = profile.GOGC
+	
 	// 메모리 최적화 초기화
 	if cs.currentConfig.EnableOptimization {
 		optimizationConfig := config.DefaultOptimizationConfig()
@@ -443,8 +573,10 @@ func (cs *ControlServer) initializeGenerator() error {
 		cs.memoryOptimizer.Start()
 	}
 	
+	// 프로파일 기반 워커 풀 생성
+	cs.workerPool = worker.NewWorkerPoolWithProfile(cs.currentConfig.TargetHost, profile)
+	
 	// 워커 풀 초기화
-	cs.workerPool = worker.NewWorkerPool(cs.currentConfig.TargetHost)
 	err := cs.workerPool.Initialize()
 	if err != nil {
 		return err
@@ -461,7 +593,54 @@ func (cs *ControlServer) startGenerator() error {
 		return fmt.Errorf("워커 풀이 초기화되지 않았습니다")
 	}
 	
-	return cs.workerPool.Start()
+	// 워커 풀 시작
+	err := cs.workerPool.Start()
+	if err != nil {
+		return err
+	}
+	
+	// 메트릭 업데이트 루프 시작
+	go cs.metricsUpdateLoop()
+	
+	return nil
+}
+
+// metricsUpdateLoop - 워커 풀에서 메트릭을 수집하여 메트릭 컬렉터로 전달
+func (cs *ControlServer) metricsUpdateLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	
+	for cs.isRunning {
+		select {
+		case <-ticker.C:
+			if cs.workerPool != nil && cs.metricsCollector != nil {
+				poolMetrics := cs.workerPool.GetMetrics()
+				
+				// 워커별 메트릭 변환
+				var workerMetrics []metrics.WorkerMetric
+				for _, wm := range poolMetrics.WorkerMetrics {
+					workerMetrics = append(workerMetrics, metrics.WorkerMetric{
+						WorkerID:   wm.WorkerID,
+						Port:       wm.Port,
+						CurrentEPS: wm.CurrentEPS,
+						TotalSent:  wm.TotalSent,
+						ErrorCount: wm.ErrorCount,
+						PacketLoss: wm.PacketLoss,
+						IsActive:   wm.CurrentEPS > 0,
+						CPUUsage:   wm.CPUUsage,
+					})
+				}
+				
+				// 메트릭 컬렉터 업데이트
+				cs.metricsCollector.UpdateWorkerMetrics(workerMetrics)
+				
+				// 시스템 메트릭 업데이트
+				current := cs.metricsCollector.GetCurrentMetrics()
+				current.CPUUsagePercent = poolMetrics.SystemMetrics.CPUUsagePercent
+				current.MemoryUsageMB = poolMetrics.SystemMetrics.MemoryUsageMB
+			}
+		}
+	}
 }
 
 func (cs *ControlServer) stopGenerator() error {

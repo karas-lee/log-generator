@@ -351,7 +351,7 @@ func (cs *ControlServer) generateControlUI() string {
 <body>
     <div class="header">
         <h1>🚀 로그 생성기 제어 대시보드</h1>
-        <div>400만 EPS 고성능 로그 전송기 - 웹 기반 완전 제어</div>
+        <div>프로파일 기반 고성능 EPS 로그 전송기 - 웹 기반 완전 제어</div>
     </div>
     
     <div class="status-bar">
@@ -394,7 +394,19 @@ func (cs *ControlServer) generateControlUI() string {
                 </div>
                 
                 <div class="form-group">
-                    <label>목표 EPS</label>
+                    <label>EPS 프로파일</label>
+                    <select id="epsProfile" onchange="onProfileChange()">
+                        <option value="100k">100K EPS (가벼운 부하)</option>
+                        <option value="500k">500K EPS (중간 부하)</option>
+                        <option value="1m">1M EPS (표준 부하)</option>
+                        <option value="2m">2M EPS (높은 부하)</option>
+                        <option value="4m" selected>4M EPS (최대 부하)</option>
+                        <option value="custom">Custom (사용자 정의)</option>
+                    </select>
+                </div>
+                
+                <div class="form-group" id="customEPSGroup" style="display:none;">
+                    <label>커스텀 목표 EPS</label>
                     <input type="number" id="targetEPS" value="4000000" min="1000" max="10000000" step="1000">
                 </div>
                 
@@ -404,8 +416,8 @@ func (cs *ControlServer) generateControlUI() string {
                 </div>
                 
                 <div class="form-group">
-                    <label>워커 수</label>
-                    <input type="number" id="workerCount" value="40" min="1" max="100">
+                    <label>워커 수 <span id="workerRecommend" style="color: #00d4ff; font-size: 0.9em;">(자동 설정: 40개)</span></label>
+                    <input type="number" id="workerCount" value="40" min="1" max="100" readonly>
                 </div>
                 
                 <div class="checkbox-group">
@@ -744,9 +756,27 @@ func (cs *ControlServer) generateControlUI() string {
             }
             
             getConfigFromForm() {
+                const profile = document.getElementById('epsProfile').value;
+                let targetEPS = 0;
+                
+                if (profile === 'custom') {
+                    targetEPS = parseInt(document.getElementById('targetEPS').value);
+                } else {
+                    // 프로파일별 기본 EPS
+                    const profileEPS = {
+                        '100k': 100000,
+                        '500k': 500000,
+                        '1m': 1000000,
+                        '2m': 2000000,
+                        '4m': 4000000
+                    };
+                    targetEPS = profileEPS[profile] || 4000000;
+                }
+                
                 return {
                     target_host: document.getElementById('targetHost').value,
-                    target_eps: parseInt(document.getElementById('targetEPS').value),
+                    profile: profile,
+                    target_eps: targetEPS,
                     duration_minutes: parseInt(document.getElementById('duration').value),
                     worker_count: parseInt(document.getElementById('workerCount').value),
                     enable_optimization: document.getElementById('enableOptimization').checked,
@@ -801,7 +831,17 @@ func (cs *ControlServer) generateControlUI() string {
                         const config = result.data;
                         
                         document.getElementById('targetHost').value = config.target_host || '127.0.0.1';
-                        document.getElementById('targetEPS').value = config.target_eps || 4000000;
+                        
+                        // 프로파일 설정
+                        if (config.profile) {
+                            document.getElementById('epsProfile').value = config.profile;
+                            onProfileChange();
+                        }
+                        
+                        if (config.profile === 'custom') {
+                            document.getElementById('targetEPS').value = config.target_eps || 4000000;
+                        }
+                        
                         document.getElementById('duration').value = config.duration_minutes || 0;
                         document.getElementById('workerCount').value = config.worker_count || 40;
                         document.getElementById('enableOptimization').checked = config.enable_optimization !== false;
@@ -905,6 +945,82 @@ func (cs *ControlServer) generateControlUI() string {
         function toggleAdvanced() {
             const advancedConfig = document.getElementById('advancedConfig');
             advancedConfig.classList.toggle('show');
+        }
+        
+        function onProfileChange() {
+            const profile = document.getElementById('epsProfile').value;
+            const customEPSGroup = document.getElementById('customEPSGroup');
+            const workerCountInput = document.getElementById('workerCount');
+            const workerRecommend = document.getElementById('workerRecommend');
+            const batchSizeInput = document.getElementById('batchSize');
+            const sendIntervalInput = document.getElementById('sendInterval');
+            const memoryLimitInput = document.getElementById('memoryLimit');
+            const gcPercentInput = document.getElementById('gcPercent');
+            
+            // 프로파일별 설정
+            const profileSettings = {
+                '100k': {
+                    workers: 2,
+                    batchSize: 10,
+                    sendInterval: 100,
+                    memoryLimit: 2,
+                    gcPercent: 100
+                },
+                '500k': {
+                    workers: 5,
+                    batchSize: 20,
+                    sendInterval: 40,
+                    memoryLimit: 4,
+                    gcPercent: 150
+                },
+                '1m': {
+                    workers: 10,
+                    batchSize: 50,
+                    sendInterval: 50,
+                    memoryLimit: 6,
+                    gcPercent: 200
+                },
+                '2m': {
+                    workers: 20,
+                    batchSize: 100,
+                    sendInterval: 50,
+                    memoryLimit: 8,
+                    gcPercent: 200
+                },
+                '4m': {
+                    workers: 40,
+                    batchSize: 200,
+                    sendInterval: 50,
+                    memoryLimit: 12,
+                    gcPercent: 200
+                },
+                'custom': {
+                    workers: 0, // 사용자가 직접 설정
+                    batchSize: 100,
+                    sendInterval: 50,
+                    memoryLimit: 8,
+                    gcPercent: 200
+                }
+            };
+            
+            const settings = profileSettings[profile] || profileSettings['4m'];
+            
+            if (profile === 'custom') {
+                customEPSGroup.style.display = 'block';
+                workerCountInput.readOnly = false;
+                workerRecommend.textContent = '(사용자 설정)';
+            } else {
+                customEPSGroup.style.display = 'none';
+                workerCountInput.readOnly = true;
+                workerCountInput.value = settings.workers;
+                workerRecommend.textContent = '(자동 설정: ' + settings.workers + '개)';
+                
+                // 고급 설정도 자동 업데이트
+                batchSizeInput.value = settings.batchSize;
+                sendIntervalInput.value = settings.sendInterval;
+                memoryLimitInput.value = settings.memoryLimit;
+                gcPercentInput.value = settings.gcPercent;
+            }
         }
         
         // 초기화

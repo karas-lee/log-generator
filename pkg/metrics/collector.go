@@ -127,6 +127,14 @@ func (mc *MetricsCollector) Start() {
 		return
 	}
 	
+	// stopChan이 닫혀있으면 재초기화
+	select {
+	case <-mc.stopChan:
+		mc.stopChan = make(chan struct{})
+	default:
+		// 이미 열려있음
+	}
+	
 	mc.wg.Add(1)
 	go mc.collectLoop()
 }
@@ -331,7 +339,16 @@ func (mc *MetricsCollector) Stop() {
 		return
 	}
 	
-	close(mc.stopChan)
+	// stopChan이 이미 닫혔는지 확인
+	select {
+	case <-mc.stopChan:
+		// 이미 닫혀있음
+		return
+	default:
+		// 닫기
+		close(mc.stopChan)
+	}
+	
 	mc.wg.Wait()
 }
 

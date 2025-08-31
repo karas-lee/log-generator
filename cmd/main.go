@@ -23,6 +23,8 @@ type AppConfig struct {
 	EnableDashboard   bool
 	EnableOptimization bool
 	LogLevel          string
+	Profile           string  // EPS 프로파일
+	TargetEPS         int     // 커스텀 EPS
 }
 
 // LogGenerator - 400만 EPS 로그 생성기 메인 애플리케이션
@@ -105,8 +107,31 @@ func parseFlags() *AppConfig {
 		"메모리/성능 최적화 활성화")
 	flag.StringVar(&config.LogLevel, "log-level", "info", 
 		"로그 레벨 (debug, info, warn, error)")
+	flag.StringVar(&config.Profile, "profile", "4m",
+		"EPS 프로파일 (100k, 500k, 1m, 2m, 4m, custom)")
+	flag.IntVar(&config.TargetEPS, "eps", 0,
+		"커스텀 목표 EPS (profile=custom일 때 사용)")
+	
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Available EPS Profiles:\n")
+		fmt.Fprintf(os.Stderr, "  100k: Light load (Workers: 2, Batch: 10)\n")
+		fmt.Fprintf(os.Stderr, "  500k: Medium load (Workers: 5, Batch: 20)\n")
+		fmt.Fprintf(os.Stderr, "  1m: Standard load (Workers: 10, Batch: 50)\n")
+		fmt.Fprintf(os.Stderr, "  2m: High load (Workers: 20, Batch: 100)\n")
+		fmt.Fprintf(os.Stderr, "  4m: Maximum load (Workers: 40, Batch: 200)\n")
+		fmt.Fprintf(os.Stderr, "  custom: Specify custom EPS target with -eps flag\n")
+		fmt.Fprintf(os.Stderr, "\nOptions:\n")
+		flag.PrintDefaults()
+	}
 	
 	flag.Parse()
+	
+	// 커스텀 프로파일 검증
+	if config.Profile == "custom" && config.TargetEPS == 0 {
+		fmt.Println("⚠️  custom 프로파일에는 -eps 플래그가 필요합니다")
+		os.Exit(1)
+	}
 	
 	return config
 }
@@ -124,13 +149,27 @@ func NewLogGenerator(appConfig *AppConfig) (*LogGenerator, error) {
 	// 메트릭 수집기 초기화
 	app.metricsCollector = metrics.NewMetricsCollector()
 	
-	// 워커 풀 초기화
-	app.workerPool = worker.NewWorkerPool(appConfig.TargetHost)
+	// 프로파일 설정
+	var profile *config.EPSProfile
+	if appConfig.Profile == "custom" {
+		profile = config.CalculateCustomProfile(appConfig.TargetEPS)
+	} else {
+		var err error
+		profile, err = config.GetProfile(appConfig.Profile)
+		if err != nil {
+			return nil, fmt.Errorf("프로파일 로드 실패: %v", err)
+		}
+	}
+	
+	// 프로파일 기반 워커 풀 초기화
+	app.workerPool = worker.NewWorkerPoolWithProfile(appConfig.TargetHost, profile)
 	
 	// 대시보드 초기화 (옵션)
 	if appConfig.EnableDashboard {
 		app.dashboard = monitor.NewDashboardServer(
 			appConfig.DashboardPort, app.metricsCollector)
+		// 프로파일 정보 설정
+		app.dashboard.SetProfile(profile.Name, int64(profile.TargetEPS))
 	}
 	
 	// 메모리 최적화 초기화 (옵션)
@@ -151,7 +190,8 @@ func (lg *LogGenerator) Start() error {
 	lg.startTime = time.Now()
 	lg.isRunning = true
 	
-	fmt.Println("🚀 400만 EPS 로그 전송기 시작")
+	profile := lg.workerPool.GetProfile()
+	fmt.Printf("🚀 %s 프로파일 로그 전송기 시작 (목표: %s EPS)\n", profile.Name, formatNumber(int64(profile.TargetEPS)))
 	fmt.Println("=" + repeatString("=", 60))
 	
 	// 시스템 정보 출력
@@ -185,7 +225,7 @@ func (lg *LogGenerator) Start() error {
 	if err != nil {
 		return fmt.Errorf("워커 풀 시작 실패: %v", err)
 	}
-	fmt.Println("✅ 워커 풀 시작 (40개 워커)")
+	fmt.Printf("✅ 워커 풀 시작 (%d개 워커)\n", lg.workerPool.GetWorkerCount())
 	
 	// 4. 웹 대시보드 시작
 	if lg.dashboard != nil {
@@ -200,7 +240,7 @@ func (lg *LogGenerator) Start() error {
 	go lg.metricsUpdateLoop()
 	
 	fmt.Println("=" + repeatString("=", 60))
-	fmt.Println("🎯 목표: 400만 EPS 달성")
+	fmt.Printf("🎯 목표: %s EPS 달성\n", formatNumber(int64(profile.TargetEPS)))
 	fmt.Println("📊 실시간 모니터링 시작...")
 	fmt.Println()
 	
@@ -258,13 +298,16 @@ func (lg *LogGenerator) updateMetrics() {
 // printQuickStats - 간단한 상태 출력
 func (lg *LogGenerator) printQuickStats(metrics metrics.PerformanceMetrics) {
 	duration := time.Since(lg.startTime)
-	achievement := float64(metrics.CurrentEPS) / float64(metrics.TargetEPS) * 100
+	profile := lg.workerPool.GetProfile()
+	achievement := float64(metrics.CurrentEPS) / float64(profile.TargetEPS) * 100
 	
-	fmt.Printf("[%s] EPS: %s/4M (%.1f%%) | 워커: %d/40 | CPU: %.1f%% | 메모리: %.0fMB\n",
+	fmt.Printf("[%s] EPS: %s/%s (%.1f%%) | 워커: %d/%d | CPU: %.1f%% | 메모리: %.0fMB\n",
 		duration.Round(time.Second).String(),
 		formatNumber(metrics.CurrentEPS),
+		formatNumber(int64(profile.TargetEPS)),
 		achievement,
 		metrics.ActiveWorkers,
+		profile.WorkerCount,
 		metrics.CPUUsagePercent,
 		metrics.MemoryUsageMB)
 }
@@ -327,6 +370,10 @@ func (lg *LogGenerator) printSystemInfo() {
 	fmt.Printf("   CPU 코어: %d개\n", runtime.NumCPU())
 	fmt.Printf("   Go 버전: %s\n", runtime.Version())
 	fmt.Printf("   목표 호스트: %s\n", lg.config.TargetHost)
+	profile := lg.workerPool.GetProfile()
+	fmt.Printf("   EPS 프로파일: %s (%s)\n", profile.Name, profile.Description)
+	fmt.Printf("   워커 수: %d, 배치 크기: %d, 타이머: %dμs\n", 
+		profile.WorkerCount, profile.BatchSize, profile.TickerInterval)
 	if lg.config.TestDurationMin > 0 {
 		fmt.Printf("   테스트 시간: %d분\n", lg.config.TestDurationMin)
 	}
@@ -356,7 +403,8 @@ func (lg *LogGenerator) printFinalReport() {
 	fmt.Printf("   일관성 점수: %.0f/100\n", finalMetrics.ConsistencyScore)
 	fmt.Printf("   효율성 점수: %.0f/100\n", finalMetrics.EfficiencyScore)
 	fmt.Printf("   패킷 손실률: %.2f%%\n", finalMetrics.PacketLoss)
-	fmt.Printf("   활성 워커: %d/40\n", finalMetrics.ActiveWorkers)
+	profile := lg.workerPool.GetProfile()
+	fmt.Printf("   활성 워커: %d/%d\n", finalMetrics.ActiveWorkers, profile.WorkerCount)
 	
 	// 성과 평가
 	if achievement >= 95 {
@@ -382,9 +430,9 @@ func printWelcomeMessage() {
  ███████╗╚██████╔╝╚██████╔╝    ╚██████╔╝███████╗██║ ╚████║███████╗██║  ██║██║  ██║   ██║   ╚██████╔╝██║  ██║
  ╚══════╝ ╚═════╝  ╚═════╝      ╚═════╝ ╚══════╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝
 `)
-	fmt.Println("🚀 시스템 로그 400만 EPS 고성능 전송기")
-	fmt.Println("📋 PRD 명세 기반 SIEM 성능 검증 도구")
-	fmt.Println("⚡ 40개 워커 × 10만 EPS = 400만 EPS 목표")
+	fmt.Println("🚀 시스템 로그 고성능 EPS 전송기")
+	fmt.Println("📋 프로파일 기반 SIEM 성능 검증 도구")
+	fmt.Println("⚡ 선택 가능한 EPS 프로파일: 100K, 500K, 1M, 2M, 4M, Custom")
 	fmt.Println()
 }
 

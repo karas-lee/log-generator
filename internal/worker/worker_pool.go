@@ -3,7 +3,9 @@ package worker
 import (
 	"context"
 	"fmt"
+	"log-generator/internal/config"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,8 +15,8 @@ import (
 const (
 	// PRD 명세: 400만 EPS = 40개 워커 × 10만 EPS
 	TOTAL_WORKERS = 40
-	FIRST_PORT = 514  // RFC 3164 표준 syslog 포트
-	LAST_PORT = 553   // 514 + 39 = 553
+	FIRST_PORT = 10514  // 높은 포트 사용 (권한 문제 회피)
+	LAST_PORT = 10553   // 10514 + 39 = 10553
 )
 
 // WorkerPoolMetrics - 워커 풀 전체 메트릭
@@ -39,12 +41,15 @@ type SystemMetrics struct {
 	NetworkTxMBps      float64 `json:"network_tx_mbps"`
 }
 
-// WorkerPool - 고성능 워커 풀 관리자 (400만 EPS 목표)
+// WorkerPool - 고성능 워커 풀 관리자 (프로파일 기반)
 type WorkerPool struct {
 	// 워커 관리
 	workers         []*UDPWorker
 	workerCount     int
 	targetHost      string
+	
+	// 프로파일 설정
+	profile         *config.EPSProfile
 	
 	// 메트릭 수집
 	metricsChannel  chan WorkerMetrics
@@ -75,14 +80,18 @@ type WorkerPool struct {
 func NewWorkerPool(targetHost string) *WorkerPool {
 	ctx, cancel := context.WithCancel(context.Background())
 	
+	// 기본 프로파일 (4M)
+	defaultProfile := config.EPSProfiles["4m"]
+	
 	pool := &WorkerPool{
 		workers:        make([]*UDPWorker, 0, TOTAL_WORKERS),
 		targetHost:     targetHost,
+		profile:        defaultProfile,
 		metricsChannel: make(chan WorkerMetrics, TOTAL_WORKERS*2), // 버퍼 크기 여유
 		ctx:            ctx,
 		cancel:         cancel,
 		epsHistory:     make([]int64, 300), // 5분간 이력
-		targetEPS:      4000000, // 400만 EPS
+		targetEPS:      int64(defaultProfile.TargetEPS),
 		autoTuning:     true,
 	}
 	
@@ -95,7 +104,40 @@ func NewWorkerPool(targetHost string) *WorkerPool {
 	return pool
 }
 
-// Initialize - 40개 워커 초기화 및 설정
+// NewWorkerPoolWithProfile - 프로파일 기반 워커 풀 생성
+func NewWorkerPoolWithProfile(targetHost string, profile *config.EPSProfile) *WorkerPool {
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	// 프로파일 기반 최적화 적용
+	if profile.GOGC > 0 {
+		debug.SetGCPercent(profile.GOGC)
+	}
+	if profile.MemoryLimit > 0 {
+		debug.SetMemoryLimit(profile.MemoryLimit)
+	}
+	
+	pool := &WorkerPool{
+		workers:        make([]*UDPWorker, 0, profile.WorkerCount),
+		targetHost:     targetHost,
+		profile:        profile,
+		metricsChannel: make(chan WorkerMetrics, profile.WorkerCount*2),
+		ctx:            ctx,
+		cancel:         cancel,
+		epsHistory:     make([]int64, 300),
+		targetEPS:      int64(profile.TargetEPS),
+		autoTuning:     false, // 프로파일 모드에서는 자동 튜닝 비활성화
+	}
+	
+	// 초기 메트릭 설정
+	pool.poolMetrics.Store(WorkerPoolMetrics{
+		WorkerMetrics: make(map[int]WorkerMetrics),
+		LastUpdate:    time.Now(),
+	})
+	
+	return pool
+}
+
+// Initialize - 프로파일 기반 워커 초기화
 func (wp *WorkerPool) Initialize() error {
 	wp.mutex.Lock()
 	defer wp.mutex.Unlock()
@@ -104,21 +146,37 @@ func (wp *WorkerPool) Initialize() error {
 		return fmt.Errorf("워커 풀이 이미 실행 중입니다")
 	}
 	
-	// 40개 워커 생성 (포트 514-553)
-	for i := 0; i < TOTAL_WORKERS; i++ {
+	// 프로파일에 따른 워커 수 결정
+	workerCount := wp.profile.WorkerCount
+	if workerCount > TOTAL_WORKERS {
+		workerCount = TOTAL_WORKERS
+	}
+	
+	// 워커 생성
+	for i := 0; i < workerCount; i++ {
 		workerID := i + 1
 		port := FIRST_PORT + i
 		
-		worker, err := NewUDPWorker(workerID, port, wp.targetHost, wp.metricsChannel)
+		// 프로파일 설정으로 워커 생성
+		worker, err := NewUDPWorkerWithConfig(workerID, port, wp.targetHost, wp.metricsChannel, 
+			wp.profile.BatchSize, wp.profile.TickerInterval)
 		if err != nil {
 			return fmt.Errorf("워커 %d 생성 실패: %v", workerID, err)
+		}
+		
+		// 버퍼 크기 설정
+		if wp.profile.SendBufferSize > 0 {
+			worker.SetBufferSizes(wp.profile.SendBufferSize*1024, wp.profile.ReceiveBufferSize*1024)
 		}
 		
 		wp.workers = append(wp.workers, worker)
 	}
 	
 	wp.workerCount = len(wp.workers)
-	fmt.Printf("✓ %d개 워커 초기화 완료 (포트 %d-%d)\n", wp.workerCount, FIRST_PORT, LAST_PORT)
+	fmt.Printf("✓ %s 프로파일: %d개 워커 초기화 완료 (포트 %d-%d)\n", 
+		wp.profile.Name, wp.workerCount, FIRST_PORT, FIRST_PORT+wp.workerCount-1)
+	fmt.Printf("  목표 EPS: %s, 배치 크기: %d, 타이머: %dμs\n",
+		formatNumber(int64(wp.profile.TargetEPS)), wp.profile.BatchSize, wp.profile.TickerInterval)
 	
 	return nil
 }
@@ -157,7 +215,7 @@ func (wp *WorkerPool) Start() error {
 		time.Sleep(time.Millisecond * 10)
 	}
 	
-	fmt.Printf("🚀 워커 풀 시작: %d개 워커 실행 중 (목표: 400만 EPS)\n", wp.workerCount)
+	fmt.Printf("🚀 워커 풀 시작: %d개 워커 실행 중 (목표: %s EPS)\n", wp.workerCount, formatNumber(wp.targetEPS))
 	
 	return nil
 }
@@ -307,8 +365,8 @@ func (wp *WorkerPool) printPerformanceLog(metrics WorkerPoolMetrics) {
 	targetAchievement := float64(metrics.TotalEPS) / float64(wp.targetEPS) * 100
 	
 	fmt.Printf("📊 성능 리포트 [%s 경과]\n", duration.Round(time.Second))
-	fmt.Printf("   현재 EPS: %s / 목표: 4,000,000 (%.1f%%)\n", 
-		formatNumber(metrics.TotalEPS), targetAchievement)
+	fmt.Printf("   현재 EPS: %s / 목표: %s (%.1f%%)\n", 
+		formatNumber(metrics.TotalEPS), formatNumber(wp.targetEPS), targetAchievement)
 	fmt.Printf("   활성 워커: %d/%d\n", metrics.ActiveWorkers, wp.workerCount)
 	fmt.Printf("   총 전송: %s logs\n", formatNumber(metrics.TotalSent))
 	fmt.Printf("   CPU: %.1f%% | 메모리: %.1f MB | 고루틴: %d\n",
@@ -385,6 +443,32 @@ func (wp *WorkerPool) IsRunning() bool {
 // GetWorkerCount - 워커 수 반환
 func (wp *WorkerPool) GetWorkerCount() int {
 	return wp.workerCount
+}
+
+// GetProfile - 현재 프로파일 반환
+func (wp *WorkerPool) GetProfile() *config.EPSProfile {
+	return wp.profile
+}
+
+// SetProfile - 프로파일 변경 (재시작 필요)
+func (wp *WorkerPool) SetProfile(profile *config.EPSProfile) error {
+	if wp.isRunning.Load() {
+		return fmt.Errorf("워커 풀 실행 중에는 프로파일을 변경할 수 없습니다")
+	}
+	
+	wp.profile = profile
+	wp.targetEPS = int64(profile.TargetEPS)
+	
+	// 프로파일 기반 시스템 최적화
+	if profile.GOGC > 0 {
+		debug.SetGCPercent(profile.GOGC)
+	}
+	if profile.MemoryLimit > 0 {
+		debug.SetMemoryLimit(profile.MemoryLimit)
+	}
+	
+	fmt.Printf("프로파일 변경: %s (%s)\n", profile.Name, profile.Description)
+	return nil
 }
 
 // EnableAutoTuning - 자동 튜닝 활성화/비활성화

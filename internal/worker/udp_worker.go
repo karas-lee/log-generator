@@ -38,12 +38,18 @@ type WorkerMetrics struct {
 	GoroutineCount  int           `json:"goroutine_count"`
 }
 
-// UDPWorker - 고성능 UDP 로그 전송 워커 (10만 EPS 목표)
+// UDPWorker - 고성능 UDP 로그 전송 워커 (프로파일 기반 EPS)
 type UDPWorker struct {
 	// 워커 식별 정보
 	ID          int
 	Port        int
 	TargetHost  string
+	
+	// 성능 설정
+	batchSize      int
+	tickerInterval int  // microseconds
+	sendBufferSize int
+	recvBufferSize int
 	
 	// 네트워크 연결
 	conn        *net.UDPConn
@@ -65,6 +71,7 @@ type UDPWorker struct {
 	// 메트릭 및 모니터링
 	metricsChannel chan WorkerMetrics
 	lastMetricTime time.Time
+	lastTotalSent  int64    // EPS 계산을 위한 이전 totalSent 값
 	epsCounts      []int64  // 1초 간격 EPS 측정용
 	epsIndex       int
 	
@@ -77,19 +84,31 @@ type UDPWorker struct {
 	ticker      *time.Ticker
 }
 
-// NewUDPWorker - 워커 생성 및 초기화
+// NewUDPWorker - 워커 생성 및 초기화 (기본 설정)
 func NewUDPWorker(id, port int, targetHost string, metricsChannel chan WorkerMetrics) (*UDPWorker, error) {
+	return NewUDPWorkerWithConfig(id, port, targetHost, metricsChannel, BATCH_SIZE, SEND_INTERVAL*1000)
+}
+
+// NewUDPWorkerWithConfig - 커스텀 설정으로 워커 생성
+func NewUDPWorkerWithConfig(id, port int, targetHost string, metricsChannel chan WorkerMetrics, 
+	batchSize int, tickerInterval int) (*UDPWorker, error) {
+	
 	worker := &UDPWorker{
 		ID:             id,
 		Port:           port,
 		TargetHost:     targetHost,
+		batchSize:      batchSize,
+		tickerInterval: tickerInterval,
+		sendBufferSize: UDP_SEND_BUFFER_SIZE,
+		recvBufferSize: UDP_RECV_BUFFER_SIZE,
 		generator:      generator.NewSystemLogGenerator(),
-		batchBuffer:    make([][]byte, 0, BATCH_SIZE),
+		batchBuffer:    make([][]byte, 0, batchSize),
 		sendBuffer:     make([]byte, 0, UDP_SEND_BUFFER_SIZE),
 		metricsChannel: metricsChannel,
 		stopChan:       make(chan struct{}),
 		epsCounts:      make([]int64, 60), // 1분간 EPS 이력
 		lastMetricTime: time.Now(),
+		lastTotalSent:  0,
 	}
 	
 	// UDP 연결 설정
@@ -98,8 +117,14 @@ func NewUDPWorker(id, port int, targetHost string, metricsChannel chan WorkerMet
 		return nil, fmt.Errorf("UDP 연결 설정 실패 (워커 %d): %v", id, err)
 	}
 	
-	// 10ms마다 배치 전송하는 타이머 설정
-	worker.ticker = time.NewTicker(time.Millisecond * SEND_INTERVAL)
+	// 프로파일 기반 타이머 설정
+	if tickerInterval < 1000 {
+		// 마이크로초 단위 타이머
+		worker.ticker = time.NewTicker(time.Duration(tickerInterval) * time.Microsecond)
+	} else {
+		// 밀리초 단위로 변환
+		worker.ticker = time.NewTicker(time.Duration(tickerInterval/1000) * time.Millisecond)
+	}
 	
 	return worker, nil
 }
@@ -141,11 +166,11 @@ func (w *UDPWorker) optimizeSocketBuffers() error {
 	
 	var syscallErr error
 	err = rawConn.Control(func(fd uintptr) {
-		syscallErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, UDP_SEND_BUFFER_SIZE)
+		syscallErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, w.sendBufferSize)
 		if syscallErr != nil {
 			return
 		}
-		syscallErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
+		syscallErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, w.recvBufferSize)
 	})
 	
 	if err != nil {
@@ -158,7 +183,13 @@ func (w *UDPWorker) optimizeSocketBuffers() error {
 	return nil
 }
 
-// Start - 워커 시작 (10만 EPS 달성을 위한 최적화된 루프)
+// SetBufferSizes - 버퍼 크기 설정
+func (w *UDPWorker) SetBufferSizes(sendSize, recvSize int) {
+	w.sendBufferSize = sendSize
+	w.recvBufferSize = recvSize
+}
+
+// Start - 워커 시작 (프로파일 기반 EPS 달성)
 func (w *UDPWorker) Start(ctx context.Context) error {
 	if !w.isRunning.CompareAndSwap(false, true) {
 		return fmt.Errorf("워커 %d가 이미 실행 중입니다", w.ID)
@@ -183,7 +214,7 @@ func (w *UDPWorker) Start(ctx context.Context) error {
 	return nil
 }
 
-// sendLoop - 핵심 전송 루프 (10만 EPS 달성)
+// sendLoop - 핵심 전송 루프 (프로파일 기반 EPS)
 func (w *UDPWorker) sendLoop(ctx context.Context) {
 	defer w.wg.Done()
 	
@@ -196,8 +227,8 @@ func (w *UDPWorker) sendLoop(ctx context.Context) {
 		case <-w.stopChan:
 			return
 		case <-w.ticker.C:
-			// 배치가 가득 찰 때까지 로그 생성
-			for len(w.batchBuffer) < BATCH_SIZE {
+			// 프로파일 기반 배치 크기까지 로그 생성
+			for len(w.batchBuffer) < w.batchSize {
 				logData := w.generator.GenerateSystemLog()
 				w.batchBuffer = append(w.batchBuffer, logData)
 			}
@@ -271,9 +302,13 @@ func (w *UDPWorker) updateEPSMetrics() {
 		totalSent := w.totalSent.Load()
 		if w.lastMetricTime.IsZero() {
 			w.currentEPS.Store(0)
+			w.lastTotalSent = totalSent
 		} else {
-			eps := int64(float64(totalSent) / duration.Seconds())
+			// 이전 측정 이후로 보낸 로그 수 계산
+			sentSinceLastUpdate := totalSent - w.lastTotalSent
+			eps := int64(float64(sentSinceLastUpdate) / duration.Seconds())
 			w.currentEPS.Store(eps)
+			w.lastTotalSent = totalSent
 		}
 		
 		// EPS 이력 업데이트
