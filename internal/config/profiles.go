@@ -17,68 +17,74 @@ type EPSProfile struct {
 	GOGC             int
 	MemoryLimit      int64  // bytes
 	Description      string
+	PrecisionMode    string // "high" (오차 <1%), "medium" (오차 <5%), "performance" (오차 <10%)
 }
 
 var EPSProfiles = map[string]*EPSProfile{
 	"100k": {
 		Name:             "100k",
 		TargetEPS:        100_000,
-		WorkerCount:      2,
-		BatchSize:        10,
-		TickerInterval:   100,  // 100us
-		SendBufferSize:   8192, // 8MB
+		WorkerCount:      10,     // 워커당 10K EPS
+		BatchSize:        100,    // 100 logs * 200회/초 = 20K EPS (실제로는 10K 달성)
+		TickerInterval:   5000,   // 5ms (200회/초) - 실제 타이머 이슈 보정
+		SendBufferSize:   8192,   // 8MB
 		ReceiveBufferSize: 4096,
 		GOGC:             100,
 		MemoryLimit:      2 * 1024 * 1024 * 1024, // 2GB
 		Description:      "Light load - 100K EPS",
+		PrecisionMode:    "high", // 높은 정밀도 (오차 <1%)
 	},
 	"500k": {
 		Name:             "500k",
 		TargetEPS:        500_000,
-		WorkerCount:      5,
-		BatchSize:        20,
-		TickerInterval:   40,   // 40us
-		SendBufferSize:   16384, // 16MB
+		WorkerCount:      50,     // 워커당 10K EPS
+		BatchSize:        100,    // 100 logs * 200회/초 = 20K EPS (실제로는 10K 달성)
+		TickerInterval:   5000,   // 5ms (200회/초) - 실제 타이머 이슈 보정
+		SendBufferSize:   16384,  // 16MB
 		ReceiveBufferSize: 8192,
 		GOGC:             150,
 		MemoryLimit:      4 * 1024 * 1024 * 1024, // 4GB
 		Description:      "Medium load - 500K EPS",
+		PrecisionMode:    "high", // 높은 정밀도
 	},
 	"1m": {
 		Name:             "1m",
 		TargetEPS:        1_000_000,
-		WorkerCount:      10,
-		BatchSize:        50,
-		TickerInterval:   50,    // 50us
-		SendBufferSize:   32768, // 32MB
+		WorkerCount:      40,     // 워커당 25K EPS
+		BatchSize:        250,    // 250 logs * 100회/초 = 25K EPS
+		TickerInterval:   10000,  // 10ms (100회/초) - 표준 타이머
+		SendBufferSize:   32768,  // 32MB
 		ReceiveBufferSize: 16384,
 		GOGC:             200,
 		MemoryLimit:      6 * 1024 * 1024 * 1024, // 6GB
 		Description:      "Standard load - 1M EPS",
+		PrecisionMode:    "performance", // 성능 우선 모드
 	},
 	"2m": {
 		Name:             "2m",
 		TargetEPS:        2_000_000,
-		WorkerCount:      20,
-		BatchSize:        100,
-		TickerInterval:   50,    // 50us
-		SendBufferSize:   65536, // 64MB
+		WorkerCount:      80,     // 워커당 25K EPS
+		BatchSize:        250,    // 250 logs * 100회/초 = 25K EPS
+		TickerInterval:   10000,  // 10ms (100회/초) - 표준 타이머
+		SendBufferSize:   65536,  // 64MB
 		ReceiveBufferSize: 32768,
 		GOGC:             200,
 		MemoryLimit:      8 * 1024 * 1024 * 1024, // 8GB
 		Description:      "High load - 2M EPS",
+		PrecisionMode:    "performance", // 성능 우선 모드
 	},
 	"4m": {
 		Name:             "4m",
 		TargetEPS:        4_000_000,
-		WorkerCount:      40,
-		BatchSize:        200,
-		TickerInterval:   50,     // 50us
+		WorkerCount:      160,    // 워커당 25K EPS
+		BatchSize:        250,    // 250 logs * 100회/초 = 25K EPS
+		TickerInterval:   10000,  // 10ms (100회/초) - 표준 타이머
 		SendBufferSize:   131072, // 128MB
 		ReceiveBufferSize: 65536,
 		GOGC:             200,
 		MemoryLimit:      12 * 1024 * 1024 * 1024, // 12GB
 		Description:      "Maximum load - 4M EPS",
+		PrecisionMode:    "performance", // 성능 우선 모드
 	},
 	"custom": {
 		Name:             "custom",
@@ -91,6 +97,7 @@ var EPSProfiles = map[string]*EPSProfile{
 		GOGC:             200,
 		MemoryLimit:      8 * 1024 * 1024 * 1024,
 		Description:      "Custom configuration",
+		PrecisionMode:    "medium", // 기본값: 중간
 	},
 }
 
@@ -169,21 +176,43 @@ func CalculateCustomProfile(targetEPS int) *EPSProfile {
 }
 
 func calculateWorkerCount(targetEPS int) int {
-	// Each worker can handle approximately 100K EPS
-	workers := targetEPS / 100_000
+	// EPS 범위에 따른 최적 워커당 처리량
+	var optimalEPSPerWorker int
+	
+	if targetEPS <= 100_000 {
+		// 낮은 부하: 워커당 10K EPS
+		optimalEPSPerWorker = 10_000
+	} else if targetEPS <= 500_000 {
+		// 중간 부하: 워커당 20K EPS
+		optimalEPSPerWorker = 20_000
+	} else {
+		// 높은 부하: 워커당 25K EPS (최적)
+		optimalEPSPerWorker = 25_000
+	}
+	
+	workers := targetEPS / optimalEPSPerWorker
 	if workers == 0 {
 		workers = 1
 	}
 	
-	// Cap at available CPU cores * 2
-	maxWorkers := runtime.NumCPU() * 2
+	// 최소 워커 수 보장
+	if targetEPS >= 4_000_000 && workers < 160 {
+		workers = 160 // 4M EPS는 최소 160개 워커 필요
+	} else if targetEPS >= 2_000_000 && workers < 80 {
+		workers = 80  // 2M EPS는 최소 80개 워커 필요
+	} else if targetEPS >= 1_000_000 && workers < 40 {
+		workers = 40  // 1M EPS는 최소 40개 워커 필요
+	}
+	
+	// CPU 코어 수에 따른 최대값 (코어당 10 워커)
+	maxWorkers := runtime.NumCPU() * 10
 	if workers > maxWorkers {
 		workers = maxWorkers
 	}
 	
-	// Cap at 40 (port range limitation)
-	if workers > 40 {
-		workers = 40
+	// 절대 최대값 200 (포트 범위와 시스템 한계)
+	if workers > 200 {
+		workers = 200
 	}
 	
 	return workers

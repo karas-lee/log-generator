@@ -181,12 +181,15 @@ func (cs *ControlServer) handleControlUI(w http.ResponseWriter, r *http.Request)
 // handleGetStatus - 현재 상태 조회
 func (cs *ControlServer) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 	cs.mutex.RLock()
-	defer cs.mutex.RUnlock()
+	isRunning := cs.isRunning
+	currentConfig := cs.currentConfig
+	workerPool := cs.workerPool
+	cs.mutex.RUnlock()
 	
 	var startTime *time.Time
 	var uptime int64
 	
-	if cs.isRunning && cs.workerPool != nil {
+	if isRunning && workerPool != nil {
 		// 실제 시작 시간과 업타임 계산
 		start := time.Now().Add(-time.Hour) // 임시값
 		startTime = &start
@@ -194,19 +197,27 @@ func (cs *ControlServer) handleGetStatus(w http.ResponseWriter, r *http.Request)
 	}
 	
 	status := GeneratorStatus{
-		IsRunning:      cs.isRunning,
+		IsRunning:      isRunning,
 		StartTime:      startTime,
 		Uptime:         uptime,
-		Config:         cs.currentConfig,
+		Config:         currentConfig,
 		WorkerStatuses: make(map[int]bool),
 	}
 	
-	// 워커 상태 추가
-	if cs.workerPool != nil {
-		poolMetrics := cs.workerPool.GetMetrics()
+	// 워커 상태 추가 - GetMetrics()는 내부적으로 atomic.Value를 사용하므로 안전
+	if workerPool != nil {
+		poolMetrics := workerPool.GetMetrics()
+		// WorkerMetrics 맵의 복사본 생성하여 concurrent access 방지
+		workerStatuses := make(map[int]bool)
+		workerMetricsCopy := make(map[int]worker.WorkerMetrics)
+		
 		for id, worker := range poolMetrics.WorkerMetrics {
-			status.WorkerStatuses[id] = worker.CurrentEPS > 0
+			workerMetricsCopy[id] = worker
+			workerStatuses[id] = worker.CurrentEPS > 0
 		}
+		
+		status.WorkerStatuses = workerStatuses
+		poolMetrics.WorkerMetrics = workerMetricsCopy
 		status.Metrics = poolMetrics
 	}
 	
@@ -274,6 +285,28 @@ func (cs *ControlServer) handleStart(w http.ResponseWriter, r *http.Request) {
 			Error:   "로그 생성기가 이미 실행 중입니다",
 		})
 		return
+	}
+	
+	// POST 요청인 경우 요청 본문에서 설정 읽기
+	if r.Method == http.MethodPost {
+		var startReq struct {
+			Profile    string `json:"profile"`
+			TargetHost string `json:"targetHost"`
+			TargetEPS  int64  `json:"targetEPS,omitempty"`
+		}
+		
+		if err := json.NewDecoder(r.Body).Decode(&startReq); err == nil {
+			// 프로파일이 지정된 경우 설정 업데이트
+			if startReq.Profile != "" {
+				cs.currentConfig.Profile = startReq.Profile
+			}
+			if startReq.TargetHost != "" {
+				cs.currentConfig.TargetHost = startReq.TargetHost
+			}
+			if startReq.TargetEPS > 0 {
+				cs.currentConfig.TargetEPS = startReq.TargetEPS
+			}
+		}
 	}
 	
 	// 설정 기반으로 로그 생성기 초기화
@@ -522,14 +555,27 @@ func (cs *ControlServer) sendJSON(w http.ResponseWriter, response ControlRespons
 	json.NewEncoder(w).Encode(response)
 }
 
-func (cs *ControlServer) validateConfig(config *GeneratorConfig) error {
-	if config.TargetEPS <= 0 || config.TargetEPS > 10000000 {
+func (cs *ControlServer) validateConfig(cfg *GeneratorConfig) error {
+	// 프로파일이 설정된 경우 프로파일 값 사용
+	if cfg.Profile != "" && cfg.Profile != "custom" {
+		profile, err := config.GetProfile(cfg.Profile)
+		if err == nil {
+			// 프로파일 값으로 덮어쓰기
+			cfg.TargetEPS = int64(profile.TargetEPS)
+			cfg.WorkerCount = profile.WorkerCount
+			return nil // 프로파일 값은 이미 검증됨
+		}
+	}
+	
+	// custom 프로파일이거나 프로파일이 없는 경우만 검증
+	if cfg.TargetEPS <= 0 || cfg.TargetEPS > 10000000 {
 		return fmt.Errorf("목표 EPS는 1-10,000,000 범위여야 합니다")
 	}
-	if config.WorkerCount <= 0 || config.WorkerCount > 100 {
-		return fmt.Errorf("워커 수는 1-100 범위여야 합니다")
+	// 워커 수 범위 검증 (1-200)
+	if cfg.WorkerCount <= 0 || cfg.WorkerCount > 200 {
+		return fmt.Errorf("워커 수는 1-200 범위여야 합니다")
 	}
-	if config.MemoryLimitGB <= 0 || config.MemoryLimitGB > 64 {
+	if cfg.MemoryLimitGB <= 0 || cfg.MemoryLimitGB > 64 {
 		return fmt.Errorf("메모리 제한은 1-64GB 범위여야 합니다")
 	}
 	return nil
@@ -556,7 +602,8 @@ func (cs *ControlServer) initializeGenerator() error {
 	}
 	
 	// 프로파일 설정 적용
-	cs.currentConfig.WorkerCount = profile.WorkerCount
+	cs.currentConfig.TargetEPS = int64(profile.TargetEPS)
+	cs.currentConfig.WorkerCount = profile.WorkerCount // 프로파일에 정의된 워커 수 사용
 	cs.currentConfig.BatchSize = profile.BatchSize
 	cs.currentConfig.SendInterval = profile.TickerInterval
 	cs.currentConfig.MemoryLimitGB = int(profile.MemoryLimit / (1024 * 1024 * 1024))
@@ -575,6 +622,11 @@ func (cs *ControlServer) initializeGenerator() error {
 	
 	// 프로파일 기반 워커 풀 생성
 	cs.workerPool = worker.NewWorkerPoolWithProfile(cs.currentConfig.TargetHost, profile)
+	
+	// 메트릭 수집기에 목표 EPS 설정
+	if cs.metricsCollector != nil {
+		cs.metricsCollector.SetTargetEPS(cs.currentConfig.TargetEPS)
+	}
 	
 	// 워커 풀 초기화
 	err := cs.workerPool.Initialize()
@@ -635,9 +687,27 @@ func (cs *ControlServer) metricsUpdateLoop() {
 				cs.metricsCollector.UpdateWorkerMetrics(workerMetrics)
 				
 				// 시스템 메트릭 업데이트
-				current := cs.metricsCollector.GetCurrentMetrics()
-				current.CPUUsagePercent = poolMetrics.SystemMetrics.CPUUsagePercent
-				current.MemoryUsageMB = poolMetrics.SystemMetrics.MemoryUsageMB
+				// TX 패킷은 총 전송된 로그 수와 동일
+				txPackets := poolMetrics.TotalSent
+				txBytes := poolMetrics.TotalSent * 512 // 평균 패킷 크기 (512 bytes)
+				
+				// 네트워크 처리량 계산 (현재 EPS 기반)
+				var txMBps float64
+				if poolMetrics.TotalEPS > 0 {
+					// 초당 바이트 = EPS * 평균 패킷 크기
+					bytesPerSec := float64(poolMetrics.TotalEPS) * 512
+					txMBps = bytesPerSec * 8 / 1024 / 1024 // Mbps로 변환
+				}
+				
+				cs.metricsCollector.UpdateSystemMetrics(
+					poolMetrics.SystemMetrics.CPUUsagePercent,
+					poolMetrics.SystemMetrics.MemoryUsageMB,
+					txMBps,
+					txPackets,
+					poolMetrics.SystemMetrics.NetworkRxPackets,
+					txBytes,
+					poolMetrics.SystemMetrics.NetworkRxBytes,
+				)
 			}
 		}
 	}

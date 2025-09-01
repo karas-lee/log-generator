@@ -20,6 +20,12 @@ type PerformanceMetrics struct {
 	MemoryUsageMB       float64   `json:"memory_usage_mb"`
 	NetworkTxMBps       float64   `json:"network_tx_mbps"`
 	
+	// 네트워크 패킷 정보
+	NetworkTxPackets    int64     `json:"network_tx_packets"`
+	NetworkRxPackets    int64     `json:"network_rx_packets"`
+	NetworkTxBytes      int64     `json:"network_tx_bytes"`
+	NetworkRxBytes      int64     `json:"network_rx_bytes"`
+	
 	// 워커 상태
 	ActiveWorkers       int       `json:"active_workers"`
 	TotalWorkers        int       `json:"total_workers"`
@@ -58,6 +64,7 @@ type MetricsCollector struct {
 	collectInterval     time.Duration
 	historySize        int
 	startTime          time.Time
+	targetEPS          int64          // 목표 EPS
 	
 	// 메트릭 저장
 	currentMetrics     atomic.Value  // PerformanceMetrics
@@ -102,6 +109,7 @@ func NewMetricsCollector() *MetricsCollector {
 		collectInterval: time.Second,     // 1초마다 수집
 		historySize:    1800,            // 30분간 이력 보관
 		startTime:      time.Now(),
+		targetEPS:      4000000,         // 기본 목표 EPS
 		epsBuffer:      make([]int64, 60), // 1분간 EPS 버퍼
 		stopChan:       make(chan struct{}),
 		alertThresholds: AlertThresholds{
@@ -114,11 +122,16 @@ func NewMetricsCollector() *MetricsCollector {
 	
 	// 초기 메트릭 설정
 	collector.currentMetrics.Store(PerformanceMetrics{
-		TargetEPS:  4000000, // 400만 EPS 목표
+		TargetEPS:  collector.targetEPS,
 		Timestamp:  time.Now(),
 	})
 	
 	return collector
+}
+
+// SetTargetEPS - 목표 EPS 설정
+func (mc *MetricsCollector) SetTargetEPS(targetEPS int64) {
+	mc.targetEPS = targetEPS
 }
 
 // Start - 메트릭 수집 시작
@@ -198,11 +211,15 @@ func (mc *MetricsCollector) collectCurrentMetrics() PerformanceMetrics {
 		CPUUsagePercent:   current.CPUUsagePercent,
 		MemoryUsageMB:     current.MemoryUsageMB,
 		NetworkTxMBps:     current.NetworkTxMBps,
+		NetworkTxPackets:  current.NetworkTxPackets,
+		NetworkRxPackets:  current.NetworkRxPackets,
+		NetworkTxBytes:    current.NetworkTxBytes,
+		NetworkRxBytes:    current.NetworkRxBytes,
 		ActiveWorkers:     current.ActiveWorkers,
 		TotalWorkers:      current.TotalWorkers,
 		Timestamp:         now,
 		UptimeSeconds:     int64(uptime.Seconds()),
-		TargetEPS:         4000000,
+		TargetEPS:         mc.targetEPS,
 		AchievementPercent: achievementPercent,
 		ConsistencyScore:  consistencyScore,
 		EfficiencyScore:   efficiencyScore,
@@ -359,7 +376,7 @@ func (mc *MetricsCollector) GetCurrentMetrics() PerformanceMetrics {
 	}
 	
 	return PerformanceMetrics{
-		TargetEPS: 4000000,
+		TargetEPS: mc.targetEPS,
 		Timestamp: time.Now(),
 	}
 }
@@ -411,6 +428,22 @@ func (mc *MetricsCollector) UpdateWorkerMetrics(workerMetrics []WorkerMetric) {
 	current.ActiveWorkers = activeWorkers
 	current.TotalWorkers = len(workerMetrics)
 	current.WorkerDetails = workerMetrics
+	
+	mc.currentMetrics.Store(current)
+}
+
+// UpdateSystemMetrics - 시스템 메트릭 업데이트
+func (mc *MetricsCollector) UpdateSystemMetrics(cpuPercent, memoryMB, networkTxMBps float64, 
+	txPackets, rxPackets, txBytes, rxBytes int64) {
+	current := mc.GetCurrentMetrics()
+	
+	current.CPUUsagePercent = cpuPercent
+	current.MemoryUsageMB = memoryMB
+	current.NetworkTxMBps = networkTxMBps
+	current.NetworkTxPackets = txPackets
+	current.NetworkRxPackets = rxPackets
+	current.NetworkTxBytes = txBytes
+	current.NetworkRxBytes = rxBytes
 	
 	mc.currentMetrics.Store(current)
 }

@@ -416,8 +416,8 @@ func (cs *ControlServer) generateControlUI() string {
                 </div>
                 
                 <div class="form-group">
-                    <label>워커 수 <span id="workerRecommend" style="color: #00d4ff; font-size: 0.9em;">(자동 설정: 40개)</span></label>
-                    <input type="number" id="workerCount" value="40" min="1" max="100" readonly>
+                    <label>워커 수 <span id="workerRecommend" style="color: #00d4ff; font-size: 0.9em;">(고정: 160개)</span></label>
+                    <input type="number" id="workerCount" value="160" min="1" max="200" readonly>
                 </div>
                 
                 <div class="checkbox-group">
@@ -483,12 +483,12 @@ func (cs *ControlServer) generateControlUI() string {
                         <div class="metric-value" id="achievementRate">0%</div>
                     </div>
                     <div class="metric-card">
-                        <h4>총 전송</h4>
+                        <h4>총 전송 로그</h4>
                         <div class="metric-value" id="totalSent">0</div>
                     </div>
                     <div class="metric-card">
                         <h4>활성 워커</h4>
-                        <div class="metric-value" id="activeWorkers">0/40</div>
+                        <div class="metric-value" id="activeWorkers">0/0</div>
                     </div>
                     <div class="metric-card">
                         <h4>CPU 사용률</h4>
@@ -498,12 +498,28 @@ func (cs *ControlServer) generateControlUI() string {
                         <h4>메모리</h4>
                         <div class="metric-value" id="memoryUsage">0MB</div>
                     </div>
+                    <div class="metric-card">
+                        <h4>총 전송 패킷</h4>
+                        <div class="metric-value" id="txPackets">0</div>
+                    </div>
+                    <div class="metric-card">
+                        <h4>TX 속도</h4>
+                        <div class="metric-value" id="txRate">0 Mbps</div>
+                    </div>
+                    <div class="metric-card">
+                        <h4>현재 패킷/초</h4>
+                        <div class="metric-value" id="txPacketsPerSec">0</div>
+                    </div>
+                    <div class="metric-card">
+                        <h4>총 전송 데이터</h4>
+                        <div class="metric-value" id="networkThroughput">0 MB</div>
+                    </div>
                 </div>
             </div>
             
             <!-- 워커 상태 -->
             <div>
-                <h2 class="section-title">🔧 워커 상태 (40개)</h2>
+                <h2 class="section-title">🔧 워커 상태 (<span id="workerStatusTitle">0</span>개)</h2>
                 <div class="worker-grid" id="workerGrid">
                     <!-- 워커 상태가 동적으로 생성됩니다 -->
                 </div>
@@ -536,22 +552,84 @@ func (cs *ControlServer) generateControlUI() string {
                 this.initializeWorkerGrid();
             }
             
+            getProfileSettings() {
+                return {
+                    '100k': {
+                        workers: 10,     // 워커당 10K EPS
+                        batchSize: 100,  // 100 logs * 100회/초
+                        sendInterval: 10,// 10ms
+                        memoryLimit: 2,
+                        gcPercent: 100
+                    },
+                    '500k': {
+                        workers: 50,     // 워커당 10K EPS
+                        batchSize: 100,  // 100 logs * 100회/초
+                        sendInterval: 10,// 10ms
+                        memoryLimit: 4,
+                        gcPercent: 150
+                    },
+                    '1m': {
+                        workers: 100,    // 워커당 10K EPS
+                        batchSize: 100,  // 100 logs * 100회/초
+                        sendInterval: 10,// 10ms
+                        memoryLimit: 6,
+                        gcPercent: 200
+                    },
+                    '2m': {
+                        workers: 100,    // 워커당 20K EPS
+                        batchSize: 200,  // 200 logs * 100회/초
+                        sendInterval: 10,// 10ms
+                        memoryLimit: 8,
+                        gcPercent: 200
+                    },
+                    '4m': {
+                        workers: 200,    // 워커당 20K EPS
+                        batchSize: 200,  // 200 logs * 100회/초
+                        sendInterval: 10,// 10ms
+                        memoryLimit: 12,
+                        gcPercent: 200
+                    },
+                    'custom': {
+                        workers: 0,
+                        batchSize: 100,
+                        sendInterval: 50,
+                        memoryLimit: 8,
+                        gcPercent: 200
+                    }
+                };
+            }
+            
             initializeUI() {
                 this.loadConfig();
                 this.updateUI();
             }
             
-            initializeWorkerGrid() {
+            initializeWorkerGrid(workerCount) {
                 const grid = document.getElementById('workerGrid');
                 grid.innerHTML = '';
                 
-                for (let i = 1; i <= 40; i++) {
+                // 프로파일에 따른 동적 워커 수
+                if (!workerCount) {
+                    // 현재 선택된 프로파일에서 워커 수 가져오기
+                    const profile = document.getElementById('epsProfile').value;
+                    const profileSettings = this.getProfileSettings();
+                    const settings = profileSettings[profile] || profileSettings['4m'];
+                    workerCount = settings.workers;
+                }
+                
+                for (let i = 1; i <= workerCount; i++) {
                     const worker = document.createElement('div');
                     worker.className = 'worker-status worker-inactive';
                     worker.id = 'worker-' + i;
                     worker.textContent = i;
                     worker.title = '워커 ' + i + ' (포트 ' + (513 + i) + ')';
                     grid.appendChild(worker);
+                }
+                
+                // 워커 상태 타이틀 업데이트
+                const workerStatusTitle = document.getElementById('workerStatusTitle');
+                if (workerStatusTitle) {
+                    workerStatusTitle.textContent = workerCount;
                 }
             }
             
@@ -644,26 +722,52 @@ func (cs *ControlServer) generateControlUI() string {
                     this.formatNumber(metrics.total_sent || 0);
                 
                 document.getElementById('activeWorkers').textContent = 
-                    (metrics.active_workers || 0) + '/40';
+                    (metrics.active_workers || 0) + '/' + (document.getElementById('workerCount').value || '0');
                 
-                if (metrics.system_metrics) {
-                    document.getElementById('cpuUsage').textContent = 
-                        (metrics.system_metrics.cpu_usage_percent || 0).toFixed(1) + '%';
-                    
-                    document.getElementById('memoryUsage').textContent = 
-                        (metrics.system_metrics.memory_usage_mb || 0).toFixed(0) + 'MB';
-                }
+                // CPU와 메모리 메트릭 업데이트
+                document.getElementById('cpuUsage').textContent = 
+                    (metrics.cpu_usage_percent || 0).toFixed(1) + '%';
+                
+                // 메모리를 자동 단위 변환하여 표시 (MB를 bytes로 변환 후 formatDataSize 적용)
+                const memoryBytes = (metrics.memory_usage_mb || 0) * 1024 * 1024;
+                document.getElementById('memoryUsage').textContent = 
+                    this.formatDataSize(memoryBytes);
+                
+                // 총 전송 패킷 수 (= 총 전송 로그 수)
+                document.getElementById('txPackets').textContent = 
+                    this.formatNumber(metrics.network_tx_packets || 0);
+                
+                // 현재 패킷/초 (= 현재 EPS)
+                document.getElementById('txPacketsPerSec').textContent = 
+                    this.formatNumber(metrics.current_eps || 0);
+                
+                // TX 속도 (현재 네트워크 전송 속도)
+                document.getElementById('txRate').textContent = 
+                    this.formatNetworkSpeed(metrics.network_tx_mbps || 0);
+                
+                // 총 전송 데이터 크기 (누적된 모든 로그의 바이트 합계)
+                const totalBytes = (metrics.network_tx_bytes || 0) + (metrics.network_rx_bytes || 0);
+                document.getElementById('networkThroughput').textContent = 
+                    this.formatDataSize(totalBytes);
             }
             
             updateWorkerStatuses(statuses) {
-                for (let i = 1; i <= 40; i++) {
+                // 현재 표시된 워커 수 가져오기
+                const workerElements = document.querySelectorAll('[id^="worker-"]');
+                const totalWorkers = workerElements.length;
+                
+                for (let i = 1; i <= totalWorkers; i++) {
                     const workerElement = document.getElementById('worker-' + i);
+                    if (!workerElement) continue;
+                    
                     const isActive = statuses[i] || false;
                     
                     if (isActive) {
                         workerElement.className = 'worker-status worker-active';
+                        workerElement.textContent = i;
                     } else {
                         workerElement.className = 'worker-status worker-inactive';
+                        workerElement.textContent = i;
                     }
                 }
             }
@@ -843,7 +947,13 @@ func (cs *ControlServer) generateControlUI() string {
                         }
                         
                         document.getElementById('duration').value = config.duration_minutes || 0;
-                        document.getElementById('workerCount').value = config.worker_count || 40;
+                        
+                        // 프로파일에 맞는 워커 수 설정
+                        const profileSettings = this.getProfileSettings();
+                        const currentProfile = document.getElementById('epsProfile').value;
+                        const profileConfig = profileSettings[currentProfile] || profileSettings['4m'];
+                        document.getElementById('workerCount').value = profileConfig.workers;
+                        
                         document.getElementById('enableOptimization').checked = config.enable_optimization !== false;
                         document.getElementById('enableDashboard').checked = config.enable_dashboard !== false;
                         document.getElementById('batchSize').value = config.batch_size || 1000;
@@ -910,12 +1020,47 @@ func (cs *ControlServer) generateControlUI() string {
             }
             
             formatNumber(num) {
-                if (num >= 1000000) {
+                if (num >= 1000000000) {
+                    return (num / 1000000000).toFixed(2) + 'B';
+                } else if (num >= 1000000) {
                     return (num / 1000000).toFixed(2) + 'M';
                 } else if (num >= 1000) {
                     return (num / 1000).toFixed(1) + 'K';
                 }
                 return num.toString();
+            }
+            
+            // 네트워크 속도 자동 단위 변환 (bps, Kbps, Mbps, Gbps, Tbps)
+            formatNetworkSpeed(mbps) {
+                if (!mbps || mbps === 0) return '0 bps';
+                
+                const bps = mbps * 1024 * 1024; // Mbps를 bps로 변환
+                
+                if (bps >= 1e12) {
+                    return (bps / 1e12).toFixed(2) + ' Tbps';
+                } else if (bps >= 1e9) {
+                    return (bps / 1e9).toFixed(2) + ' Gbps';
+                } else if (bps >= 1e6) {
+                    return (bps / 1e6).toFixed(2) + ' Mbps';
+                } else if (bps >= 1e3) {
+                    return (bps / 1e3).toFixed(2) + ' Kbps';
+                }
+                return bps.toFixed(0) + ' bps';
+            }
+            
+            // 데이터 크기 자동 단위 변환 (B, KB, MB, GB, TB, PB)
+            formatDataSize(bytes) {
+                if (!bytes || bytes === 0) return '0 B';
+                
+                const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+                const k = 1024;
+                const i = Math.floor(Math.log(bytes) / Math.log(k));
+                
+                if (i >= units.length) {
+                    return (bytes / Math.pow(k, units.length - 1)).toFixed(2) + ' ' + units[units.length - 1];
+                }
+                
+                return (bytes / Math.pow(k, i)).toFixed(2) + ' ' + units[i];
             }
         }
         
@@ -957,50 +1102,14 @@ func (cs *ControlServer) generateControlUI() string {
             const memoryLimitInput = document.getElementById('memoryLimit');
             const gcPercentInput = document.getElementById('gcPercent');
             
-            // 프로파일별 설정
-            const profileSettings = {
-                '100k': {
-                    workers: 2,
-                    batchSize: 10,
-                    sendInterval: 100,
-                    memoryLimit: 2,
-                    gcPercent: 100
-                },
-                '500k': {
-                    workers: 5,
-                    batchSize: 20,
-                    sendInterval: 40,
-                    memoryLimit: 4,
-                    gcPercent: 150
-                },
-                '1m': {
-                    workers: 10,
-                    batchSize: 50,
-                    sendInterval: 50,
-                    memoryLimit: 6,
-                    gcPercent: 200
-                },
-                '2m': {
-                    workers: 20,
-                    batchSize: 100,
-                    sendInterval: 50,
-                    memoryLimit: 8,
-                    gcPercent: 200
-                },
-                '4m': {
-                    workers: 40,
-                    batchSize: 200,
-                    sendInterval: 50,
-                    memoryLimit: 12,
-                    gcPercent: 200
-                },
-                'custom': {
-                    workers: 0, // 사용자가 직접 설정
-                    batchSize: 100,
-                    sendInterval: 50,
-                    memoryLimit: 8,
-                    gcPercent: 200
-                }
+            // controller가 있으면 그에서 프로파일 설정 가져오기
+            const profileSettings = controller ? controller.getProfileSettings() : {
+                '100k': { workers: 10, batchSize: 100, sendInterval: 10, memoryLimit: 2, gcPercent: 100 },
+                '500k': { workers: 50, batchSize: 100, sendInterval: 10, memoryLimit: 4, gcPercent: 150 },
+                '1m': { workers: 100, batchSize: 100, sendInterval: 10, memoryLimit: 6, gcPercent: 200 },
+                '2m': { workers: 100, batchSize: 200, sendInterval: 10, memoryLimit: 8, gcPercent: 200 },
+                '4m': { workers: 200, batchSize: 200, sendInterval: 10, memoryLimit: 12, gcPercent: 200 },
+                'custom': { workers: 0, batchSize: 100, sendInterval: 50, memoryLimit: 8, gcPercent: 200 }
             };
             
             const settings = profileSettings[profile] || profileSettings['4m'];
@@ -1014,6 +1123,17 @@ func (cs *ControlServer) generateControlUI() string {
                 workerCountInput.readOnly = true;
                 workerCountInput.value = settings.workers;
                 workerRecommend.textContent = '(자동 설정: ' + settings.workers + '개)';
+                
+                // 워커 그리드 업데이트
+                if (controller && controller.initializeWorkerGrid) {
+                    controller.initializeWorkerGrid(settings.workers);
+                }
+                
+                // 워커 상태 타이틀 업데이트
+                const workerStatusTitle = document.getElementById('workerStatusTitle');
+                if (workerStatusTitle) {
+                    workerStatusTitle.textContent = settings.workers;
+                }
                 
                 // 고급 설정도 자동 업데이트
                 batchSizeInput.value = settings.batchSize;

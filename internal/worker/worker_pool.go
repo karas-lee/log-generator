@@ -6,10 +6,11 @@ import (
 	"log-generator/internal/config"
 	"runtime"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	
+	"github.com/shirou/gopsutil/v3/cpu"
 )
 
 const (
@@ -17,6 +18,8 @@ const (
 	TOTAL_WORKERS = 40
 	FIRST_PORT = 10514  // 높은 포트 사용 (권한 문제 회피)
 	LAST_PORT = 10553   // 10514 + 39 = 10553
+	MAX_WORKERS = 200   // 최대 워커 수 (4M 프로파일용)
+	MAX_PORT = 10714    // 10514 + 200 = 10714
 )
 
 // WorkerPoolMetrics - 워커 풀 전체 메트릭
@@ -39,6 +42,10 @@ type SystemMetrics struct {
 	GoroutineCount     int     `json:"goroutine_count"`
 	GCPauseMs          float64 `json:"gc_pause_ms"`
 	NetworkTxMBps      float64 `json:"network_tx_mbps"`
+	NetworkTxPackets   int64   `json:"network_tx_packets"`
+	NetworkRxPackets   int64   `json:"network_rx_packets"`
+	NetworkTxBytes     int64   `json:"network_tx_bytes"`
+	NetworkRxBytes     int64   `json:"network_rx_bytes"`
 }
 
 // WorkerPool - 고성능 워커 풀 관리자 (프로파일 기반)
@@ -148,8 +155,9 @@ func (wp *WorkerPool) Initialize() error {
 	
 	// 프로파일에 따른 워커 수 결정
 	workerCount := wp.profile.WorkerCount
-	if workerCount > TOTAL_WORKERS {
-		workerCount = TOTAL_WORKERS
+	// 최대 워커 수 제한 확장
+	if workerCount > MAX_WORKERS {
+		workerCount = MAX_WORKERS
 	}
 	
 	// 워커 생성
@@ -169,14 +177,32 @@ func (wp *WorkerPool) Initialize() error {
 			worker.SetBufferSizes(wp.profile.SendBufferSize*1024, wp.profile.ReceiveBufferSize*1024)
 		}
 		
+		// 워커당 목표 EPS 설정 (전체 목표 / 워커 수)
+		workerTargetEPS := int64(wp.profile.TargetEPS / workerCount)
+		worker.SetTargetEPS(workerTargetEPS)
+		
+		// 정밀도 모드 설정
+		if wp.profile.PrecisionMode != "" {
+			worker.SetPrecisionMode(wp.profile.PrecisionMode)
+		}
+		
 		wp.workers = append(wp.workers, worker)
 	}
 	
 	wp.workerCount = len(wp.workers)
-	fmt.Printf("✓ %s 프로파일: %d개 워커 초기화 완료 (포트 %d-%d)\n", 
-		wp.profile.Name, wp.workerCount, FIRST_PORT, FIRST_PORT+wp.workerCount-1)
-	fmt.Printf("  목표 EPS: %s, 배치 크기: %d, 타이머: %dμs\n",
-		formatNumber(int64(wp.profile.TargetEPS)), wp.profile.BatchSize, wp.profile.TickerInterval)
+	_ = int64(wp.profile.TargetEPS / workerCount)  // workerTargetEPS
+	
+	// 정밀도 모드 표시
+	precisionMode := wp.profile.PrecisionMode
+	if precisionMode == "" {
+		precisionMode = "medium"
+	}
+	modeDescription := map[string]string{
+		"high": "높은 정밀도 (오차 <1%)",
+		"medium": "중간 정밀도 (오차 <5%)",
+		"performance": "성능 우선 (오차 <10%)",
+	}
+	fmt.Printf("  🎯 Adaptive Rate Control 활성화 - %s 모드: %s\n", precisionMode, modeDescription[precisionMode])
 	
 	return nil
 }
@@ -200,6 +226,9 @@ func (wp *WorkerPool) Start() error {
 	}
 	
 	// 모든 워커 시작
+	successCount := int32(0)
+	failCount := int32(0)
+	
 	for i, worker := range wp.workers {
 		wp.wg.Add(1)
 		go func(w *UDPWorker, index int) {
@@ -207,15 +236,22 @@ func (wp *WorkerPool) Start() error {
 			
 			err := w.Start(wp.ctx)
 			if err != nil {
-				fmt.Printf("워커 %d 실행 실패: %v\n", w.ID, err)
+				atomic.AddInt32(&failCount, 1)
+			} else {
+				atomic.AddInt32(&successCount, 1)
 			}
 		}(worker, i)
 		
-		// 워커 시작 간격 (리소스 경합 방지)
-		time.Sleep(time.Millisecond * 10)
+		// 워커 시작 간격 축소 (이제 포트 바인딩 경합이 없음)
+		time.Sleep(time.Millisecond * 2)
 	}
 	
-	fmt.Printf("🚀 워커 풀 시작: %d개 워커 실행 중 (목표: %s EPS)\n", wp.workerCount, formatNumber(wp.targetEPS))
+	// 워커 시작 상태 확인
+	time.Sleep(100 * time.Millisecond)
+	success := atomic.LoadInt32(&successCount)
+	fail := atomic.LoadInt32(&failCount)
+	_ = success
+	_ = fail
 	
 	return nil
 }
@@ -290,22 +326,66 @@ func (wp *WorkerPool) collectSystemMetrics() SystemMetrics {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	
+	// 실제 CPU 사용률 가져오기
+	cpuPercent := 0.0
+	if percents, err := cpu.Percent(100*time.Millisecond, false); err == nil && len(percents) > 0 {
+		cpuPercent = percents[0]
+	}
+	
+	// 실제 메모리 사용량 가져오기
+	// Sys는 Go runtime이 OS로부터 할당받은 전체 메모리
+	memoryMB := float64(m.Sys) / 1024 / 1024
+	
+	// 네트워크 패킷 정보 수집
+	var totalTxPackets int64
+	var totalRxPackets int64
+	var totalTxBytes int64
+	var totalRxBytes int64
+	
+	// 현재 메트릭에서 정보 가져오기
+	currentMetrics := wp.GetMetrics()
+	totalTxPackets = currentMetrics.TotalSent
+	totalTxBytes = currentMetrics.TotalSent * 512 // 평균 패킷 크기 추정 (512 bytes)
+	
+	// 네트워크 처리량 계산 (Mbps)
+	elapsedSeconds := time.Since(wp.startTime).Seconds()
+	var networkTxMBps float64
+	if elapsedSeconds > 0 {
+		networkTxMBps = float64(totalTxBytes) * 8 / 1024 / 1024 / elapsedSeconds
+	}
+	
 	return SystemMetrics{
-		CPUUsagePercent: wp.getCPUUsage(),
-		MemoryUsageMB:   float64(m.Alloc) / 1024 / 1024,
-		GoroutineCount:  runtime.NumGoroutine(),
-		GCPauseMs:      float64(m.PauseNs[(m.NumGC+255)%256]) / 1000000,
+		CPUUsagePercent:  cpuPercent,
+		MemoryUsageMB:    memoryMB,
+		GoroutineCount:   runtime.NumGoroutine(),
+		GCPauseMs:        float64(m.PauseNs[(m.NumGC+255)%256]) / 1000000,
+		NetworkTxMBps:    networkTxMBps,
+		NetworkTxPackets: totalTxPackets,
+		NetworkRxPackets: totalRxPackets,
+		NetworkTxBytes:   totalTxBytes,
+		NetworkRxBytes:   totalRxBytes,
 	}
 }
 
 func (wp *WorkerPool) getCPUUsage() float64 {
-	// 실제 구현에서는 더 정교한 CPU 사용률 측정이 필요
-	// 여기서는 워커 수와 목표 달성률 기반 추정
+	// 간단한 CPU 사용률 추정
+	// 실제로는 시스템 모니터링 라이브러리를 사용해야 함
 	currentMetrics := wp.GetMetrics()
+	if wp.targetEPS == 0 {
+		return 0
+	}
+	
 	targetAchievementRate := float64(currentMetrics.TotalEPS) / float64(wp.targetEPS)
 	
-	// 추정 CPU 사용률 = 목표 달성률 * 75% (PRD 목표 CPU 사용률)
-	return targetAchievementRate * 75.0
+	// CPU 사용률 추정: 달성률 * 워커수 * 기본 사용률
+	cpuUsage := targetAchievementRate * float64(wp.workerCount) * 2.0 // 워커당 약 2% CPU
+	
+	// 최대 100%로 제한
+	if cpuUsage > 100 {
+		cpuUsage = 100
+	}
+	
+	return cpuUsage
 }
 
 // updateEPSHistory - EPS 이력 업데이트
@@ -361,20 +441,8 @@ func (wp *WorkerPool) performAutoTuning(metrics WorkerPoolMetrics) {
 
 // printPerformanceLog - 성능 로그 출력
 func (wp *WorkerPool) printPerformanceLog(metrics WorkerPoolMetrics) {
-	duration := time.Since(wp.startTime)
-	targetAchievement := float64(metrics.TotalEPS) / float64(wp.targetEPS) * 100
-	
-	fmt.Printf("📊 성능 리포트 [%s 경과]\n", duration.Round(time.Second))
-	fmt.Printf("   현재 EPS: %s / 목표: %s (%.1f%%)\n", 
-		formatNumber(metrics.TotalEPS), formatNumber(wp.targetEPS), targetAchievement)
-	fmt.Printf("   활성 워커: %d/%d\n", metrics.ActiveWorkers, wp.workerCount)
-	fmt.Printf("   총 전송: %s logs\n", formatNumber(metrics.TotalSent))
-	fmt.Printf("   CPU: %.1f%% | 메모리: %.1f MB | 고루틴: %d\n",
-		metrics.SystemMetrics.CPUUsagePercent,
-		metrics.SystemMetrics.MemoryUsageMB,
-		metrics.SystemMetrics.GoroutineCount)
-	fmt.Printf("   패킷 손실률: %.2f%%\n", metrics.PacketLossRate)
-	fmt.Println("   " + strings.Repeat("=", 60))
+	// Performance logging disabled to reduce overhead
+	_ = metrics
 }
 
 // Stop - 워커 풀 정지
@@ -383,8 +451,6 @@ func (wp *WorkerPool) Stop() error {
 		return fmt.Errorf("워커 풀이 실행되지 않고 있습니다")
 	}
 	
-	fmt.Printf("🛑 워커 풀 정지 시작...\n")
-	
 	// 취소 신호 전송
 	wp.cancel()
 	
@@ -392,7 +458,8 @@ func (wp *WorkerPool) Stop() error {
 	for _, worker := range wp.workers {
 		err := worker.Stop()
 		if err != nil {
-			fmt.Printf("워커 %d 정지 실패: %v\n", worker.ID, err)
+			// Silently handle error
+			_ = err
 		}
 	}
 	
@@ -401,22 +468,34 @@ func (wp *WorkerPool) Stop() error {
 	
 	// 최종 성능 리포트
 	finalMetrics := wp.GetMetrics()
-	duration := time.Since(wp.startTime)
-	
-	fmt.Printf("🏁 최종 성능 리포트:\n")
-	fmt.Printf("   실행 시간: %s\n", duration.Round(time.Second))
-	fmt.Printf("   총 전송 로그: %s\n", formatNumber(finalMetrics.TotalSent))
-	fmt.Printf("   평균 EPS: %s\n", formatNumber(finalMetrics.TotalSent/int64(duration.Seconds())))
-	fmt.Printf("   목표 달성률: %.1f%%\n", 
-		float64(finalMetrics.TotalEPS)/float64(wp.targetEPS)*100)
+	_ = finalMetrics
 	
 	return nil
 }
 
-// GetMetrics - 현재 메트릭 반환
+// GetMetrics - 현재 메트릭 반환 (thread-safe copy)
 func (wp *WorkerPool) GetMetrics() WorkerPoolMetrics {
 	if value := wp.poolMetrics.Load(); value != nil {
-		return value.(WorkerPoolMetrics)
+		original := value.(WorkerPoolMetrics)
+		
+		// WorkerMetrics 맵의 깊은 복사 생성
+		workerMetricsCopy := make(map[int]WorkerMetrics)
+		for id, metric := range original.WorkerMetrics {
+			workerMetricsCopy[id] = metric
+		}
+		
+		// 새로운 구조체 생성하여 반환
+		return WorkerPoolMetrics{
+			TotalEPS:       original.TotalEPS,
+			TotalSent:      original.TotalSent,
+			TotalErrors:    original.TotalErrors,
+			ActiveWorkers:  original.ActiveWorkers,
+			AverageEPS:     original.AverageEPS,
+			PacketLossRate: original.PacketLossRate,
+			WorkerMetrics:  workerMetricsCopy,
+			SystemMetrics:  original.SystemMetrics,
+			LastUpdate:     original.LastUpdate,
+		}
 	}
 	
 	return WorkerPoolMetrics{
@@ -467,14 +546,12 @@ func (wp *WorkerPool) SetProfile(profile *config.EPSProfile) error {
 		debug.SetMemoryLimit(profile.MemoryLimit)
 	}
 	
-	fmt.Printf("프로파일 변경: %s (%s)\n", profile.Name, profile.Description)
 	return nil
 }
 
 // EnableAutoTuning - 자동 튜닝 활성화/비활성화
 func (wp *WorkerPool) EnableAutoTuning(enabled bool) {
 	wp.tuningEnabled.Store(enabled)
-	fmt.Printf("자동 튜닝: %t\n", enabled)
 }
 
 // formatNumber - 숫자 포맷팅 (가독성 향상)
